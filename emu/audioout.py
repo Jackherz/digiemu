@@ -236,6 +236,14 @@ class _AudioQueueOut:
         self.rate, self.channels = rate, channels
         self.frame = 2 * channels
         self.block = max(self.frame, rate * block_ms // 1000 * self.frame)
+        # macOS AudioQueue can stay silent with very small buffers (see
+        # StackOverflow reports of 150-sample buffers producing no sound).
+        # Enforce a minimum that is known to work: at least 1024 frames and
+        # at least 20 ms, matching the PulseAudio backend's 1024-frame
+        # minimum and the Player's default.
+        min_frames = 1024
+        min_20ms = rate * 20 // 1000
+        self.block = max(self.block, min_frames * self.frame, min_20ms * self.frame)
         self.buffers = buffers
         self.dropped = 0
         self.played = 0
@@ -271,11 +279,15 @@ class _AudioQueueOut:
                 self.close()
                 raise OSError('AudioQueueAllocateBuffer failed: %d' % err)
             self._bufs.append(buf)
-            self._buf_map[ctypes.addressof(buf.contents)] = i
+            # Use the buffer's own address as the key: addressof(contents)
+            # can be fragile if contents returns a temporary copy, while the
+            # pointer value itself is the stable identity AudioQueue returns
+            # in the callback.
+            self._buf_map[ctypes.cast(buf, ctypes.c_void_p).value] = i
             self._free_indices.append(i)
 
     def _on_buffer_done(self, user_data, aq, buf_ptr):
-        addr = ctypes.addressof(buf_ptr.contents)
+        addr = ctypes.cast(buf_ptr, ctypes.c_void_p).value
         idx = self._buf_map.get(addr)
         if idx is not None:
             with self._lock:
@@ -325,8 +337,14 @@ class _AudioQueueOut:
             with self._lock:
                 self._free_indices.append(i)
             return True
-        if not self._started:
-            self._lib.AudioQueueStart(self._aq, None)
+        # Always (re)start the queue after a successful enqueue. If the
+        # queue had run dry and stopped (or was never started), this
+        # restarts it; if it is already running, AudioQueueStart is
+        # idempotent and does nothing. The previous code only started once,
+        # so after the first underrun live audio would stay silent forever
+        # on macOS.
+        err_start = self._lib.AudioQueueStart(self._aq, None)
+        if err_start == 0:
             self._started = True
         self.played += 1
         return True
