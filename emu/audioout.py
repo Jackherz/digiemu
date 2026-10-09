@@ -18,6 +18,7 @@ audible as a gap rather than a stall.
 from __future__ import annotations
 
 import array
+import collections
 import ctypes
 import ctypes.util
 import os
@@ -102,6 +103,7 @@ class _WinMMOut:
         self.frame = 2 * channels
         self.block = max(self.frame,
                          rate * block_ms // 1000 * self.frame)
+        self.block_ms = self.block * 1000 // (rate * self.frame)
         self.dropped = 0
         self.played = 0
         self._pending = bytearray()
@@ -135,7 +137,7 @@ class _WinMMOut:
         """Blocks handed to the device and not yet played."""
         return sum(1 for h in self._hdrs if not h.dwFlags & WHDR_DONE)
 
-    def write(self, pcm, block=False, abort=None):
+    def write(self, pcm, block=False, abort=None, timeout=None):
         """Append 16-bit LE PCM; full blocks go to the device at once.
 
         block=False drops a block that finds every buffer busy (live use:
@@ -221,13 +223,116 @@ class _AudioQueueBuffer(ctypes.Structure):
     ]
 
 
+# AudioQueue's two callbacks. Declared once at module level so the same
+# prototype is used both for the call and for the listener registration.
+_AQ_BUFFER_CB = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_AudioQueueBuffer))
+_AQ_PROP_CB = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32)
+
+
+# AudioQueue property IDs, as the four-character codes AudioToolbox uses.
+K_AQ_IS_RUNNING = 0x72756e6e            # 'runn'
+K_AQ_CURRENT_DEVICE = 0x64657669        # 'devi'
+K_AQ_DEVICE_SAMPLE_RATE = 0x64737274    # 'dsrt'
+K_AQ_MAX_OUTPUT_FRAME_COUNT = 0x6d6f6663  # 'mofc'
+
+# The OSStatus values AudioQueue reports. Every one of them is swallowed by
+# the old code: a live output that went silent reported a healthy queue.
+AQ_ERRORS = {
+    -66687: 'kAudioQueueErr_InvalidBuffer',
+    -66686: 'kAudioQueueErr_BufferEmpty',
+    -66685: 'kAudioQueueErr_DisposalPending',
+    -66684: 'kAudioQueueErr_InvalidProperty',
+    -66683: 'kAudioQueueErr_InvalidPropertySize',
+    -66682: 'kAudioQueueErr_InvalidParameter',
+    -66681: 'kAudioQueueErr_CannotStart',
+    -66680: 'kAudioQueueErr_InvalidDevice',
+    -66679: 'kAudioQueueErr_BufferInQueue',
+    -66678: 'kAudioQueueErr_InvalidRunState',
+    -66677: 'kAudioQueueErr_InvalidOfflineState',
+    -66676: 'kAudioQueueErr_Permissions',
+    -66675: 'kAudioQueueErr_InvalidPropertyValue',
+    -66674: 'kAudioQueueErr_PrimeTimedOut',
+    -66673: 'kAudioQueueErr_CodecNotFound',
+    -66672: 'kAudioQueueErr_InvalidCodecAccess',
+    -66671: 'kAudioQueueErr_QueueInvalidated',
+    -66668: 'kAudioQueueErr_RecordUnderrun',
+    -66632: 'kAudioQueueErr_EnqueueDuringReset',
+    -66626: 'kAudioQueueErr_InvalidOfflineMode',
+}
+# The one failure that means the queue still owns the buffer, so it must not
+# go back on the free list: doing so hands the same buffer out twice, and
+# every later enqueue of it fails the same way.
+AQ_BUFFER_IN_QUEUE = -66679
+
+
+def osstatus_text(err):
+    """A readable name for an OSStatus, for the log lines."""
+    if err == 0:
+        return 'noErr'
+    name = AQ_ERRORS.get(err)
+    if name is not None:
+        return '%s (%d)' % (name, err)
+    # Core Audio also reports four-character codes as an OSStatus.
+    raw = struct.pack('>I', err & 0xFFFFFFFF)
+    if all(0x20 <= b <= 0x7E for b in raw):
+        return "'%s' (%d)" % (raw.decode('ascii'), err)
+    return str(err)
+
+
+def _fourcc(value):
+    """A UInt32 as 'Buil' when it is printable, else as a plain number."""
+    raw = value & 0xFFFFFFFF
+    text = struct.pack('>I', raw)
+    if all(0x20 <= b <= 0x7E for b in text):
+        return "'%s' (%d)" % (text.decode('ascii'), value)
+    return str(value)
+
+
 class _AudioQueueOut:
-    """Queue 16-bit stereo PCM to the default macOS output device via AudioQueue."""
+    """Queue 16-bit stereo PCM to the default macOS output device via AudioQueue.
+
+    Live output on macOS has been observed to play for a moment at start-up
+    and then go silent for good, while the recording made from the same
+    stream stays complete -- so the samples are rendered, and only the path
+    to the device stops. Every OSStatus, every buffer callback and every
+    queue property transition this backend sees is therefore counted and
+    logged: `diagnostics()` is one line naming them, `close()` prints it,
+    and the panel polls it on its own cadence while audio is live
+    (Emulator.LIVE_DIAG_S in emu/gui.py).
+
+    The counts that decide between the candidate causes:
+
+    * `start_err` non-zero -- AudioQueueStart has stopped working, and the
+      queue is silent while looking busy. `last_status` names the error.
+    * `running=0` while `cb` still climbs -- the queue stopped itself.
+    * `cb` frozen while `enq` climbs -- the device stopped taking buffers.
+    * `dev` changing -- the default output device moved out from under the
+      queue (display, Bluetooth, an aggregate device).
+    * `hwrate` differing from `rate` -- the device is not at 48 kHz.
+    * `wait_to` non-zero -- the queue ran out of free buffers and a blocking
+      write gave up rather than wedge the emulator thread.
+    """
+
+    # A blocking write waits at most this long for a free buffer before it
+    # drops the block (live use). Without a limit, a device that stops
+    # handing buffers back wedges the calling thread forever -- the emulator
+    # worker calls write(block=True), so it would take the run with it.
+    WRITE_WAIT_S = 2.0
+    EVENTS_KEPT = 64        # lifecycle events kept for the log
+
+    _now = staticmethod(time.monotonic)
+    _props = ((K_AQ_IS_RUNNING, 'running', ctypes.c_uint32, None),
+              (K_AQ_CURRENT_DEVICE, 'dev', ctypes.c_uint32, 'fourcc'),
+              (K_AQ_DEVICE_SAMPLE_RATE, 'hwrate', ctypes.c_double, 'rate'),
+              (K_AQ_MAX_OUTPUT_FRAME_COUNT, 'maxframes', ctypes.c_uint32, None))
 
     def __init__(self, rate=48000, channels=2, buffers=16, block_ms=20):
-        path = ctypes.util.find_library('AudioToolbox') or (
-            '/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox'
-        )
+        path = (os.environ.get('DIGIEMU_AUDIOTOOLBOX')
+                or ctypes.util.find_library('AudioToolbox')
+                or '/System/Library/Frameworks/AudioToolbox.framework/'
+                   'AudioToolbox')
         try:
             self._lib = ctypes.CDLL(path)
         except OSError as exc:
@@ -243,14 +348,38 @@ class _AudioQueueOut:
         # minimum and the Player's default.
         min_frames = 1024
         min_20ms = rate * 20 // 1000
-        self.block = max(self.block, min_frames * self.frame, min_20ms * self.frame)
+        self.block = max(self.block, min_frames * self.frame,
+                         min_20ms * self.frame)
+        self.block_ms = self.block * 1000 // (rate * self.frame)
         self.buffers = buffers
         self.dropped = 0
         self.played = 0
         self.gain = 1.0
         self._pending = bytearray()
-        self._started = False
         self._lock = threading.Lock()
+        self._closed = False
+
+        # Lifecycle instrumentation. Everything here is read by the panel
+        # and by close(); nothing in it may block or raise.
+        self._t0 = self._now()
+        self.enqueued = 0
+        self.enqueue_err = 0
+        self.start_ok = 0
+        self.start_err = 0
+        self.cb = 0                     # buffer-completion callbacks
+        self.cb_bytes = 0
+        self.cb_unknown = 0             # callbacks for a buffer we lost track of
+        self.cb_recycled_twice = 0      # a buffer returned while already free
+        self.lost_buffers = 0           # never came back from the queue
+        self.wait_to = 0                # blocking writes that gave up
+        self.last_status = 0
+        self.last_cb_t = None
+        self.last_cb_gap_s = 0.0
+        self.running_events = 0
+        self._events = collections.deque(maxlen=self.EVENTS_KEPT)
+        self._props_seen = {}
+
+        self._bind(self._lib)
 
         # kAudioFormatLinearPCM ('lpcm'), signed integer and packed: plain
         # interleaved 16-bit stereo, one frame per packet.
@@ -258,26 +387,32 @@ class _AudioQueueOut:
             float(rate), 0x6c70636d, (1 << 2) | (1 << 3), self.frame, 1,
             self.frame, channels, 16, 0
         )
-        self._cb_type = ctypes.CFUNCTYPE(
-            None, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_AudioQueueBuffer)
-        )
-        self._cb = self._cb_type(self._on_buffer_done)
+        self._cb_type = _AQ_BUFFER_CB
+        self._cb_fn = self._cb_type(self._on_buffer_done)
+        self._prop_cb_fn = _AQ_PROP_CB(self._on_property)
         self._aq = ctypes.c_void_p()
         err = self._lib.AudioQueueNewOutput(
-            ctypes.byref(fmt), self._cb, None, None, None, 0, ctypes.byref(self._aq)
-        )
+            ctypes.byref(fmt), self._cb_fn, None, None, None, 0,
+            ctypes.byref(self._aq))
         if err != 0:
-            raise OSError('AudioQueueNewOutput failed: %d' % err)
+            self.last_status = err
+            raise OSError('AudioQueueNewOutput failed: %s'
+                          % osstatus_text(err))
+        self._event('new', err)
 
         self._bufs = []
         self._buf_map = {}
         self._free_indices = []
+        self._in_queue = set()          # indices the queue currently owns
         for i in range(buffers):
             buf = ctypes.POINTER(_AudioQueueBuffer)()
-            err = self._lib.AudioQueueAllocateBuffer(self._aq, self.block, ctypes.byref(buf))
+            err = self._lib.AudioQueueAllocateBuffer(self._aq, self.block,
+                                                     ctypes.byref(buf))
             if err != 0:
+                self.last_status = err
                 self.close()
-                raise OSError('AudioQueueAllocateBuffer failed: %d' % err)
+                raise OSError('AudioQueueAllocateBuffer failed: %s'
+                              % osstatus_text(err))
             self._bufs.append(buf)
             # Use the buffer's own address as the key: addressof(contents)
             # can be fragile if contents returns a temporary copy, while the
@@ -286,19 +421,249 @@ class _AudioQueueOut:
             self._buf_map[ctypes.cast(buf, ctypes.c_void_p).value] = i
             self._free_indices.append(i)
 
+        err = self._lib.AudioQueueAddPropertyListener(
+            self._aq, K_AQ_IS_RUNNING, self._prop_cb_fn, None)
+        if err != 0:
+            # Not fatal: the poll in _update_properties() still sees it.
+            self._event('listener', err)
+        self._update_properties()
+        print('[audio] audioqueue: rate %d, block %d B (%d ms), %d buffers, '
+              'device %s, hw rate %s'
+              % (rate, self.block, self.block_ms, buffers,
+                 self._props_seen.get('dev'),
+                 self._props_seen.get('hwrate')), flush=True)
+
+    @staticmethod
+    def _bind(lib):
+        """Declare the AudioQueue prototypes.
+
+        Without argtypes, ctypes guesses each argument's type and assumes an
+        int result; on 64-bit that is enough to lose an error code, which is
+        the one thing this diagnosis must not do.
+        """
+        aq = ctypes.c_void_p
+        buf = ctypes.POINTER(_AudioQueueBuffer)
+        u32 = ctypes.c_uint32
+        p_u32 = ctypes.POINTER(ctypes.c_uint32)
+        p_aq = ctypes.POINTER(ctypes.c_void_p)
+        lib.AudioQueueNewOutput.restype = ctypes.c_int32
+        lib.AudioQueueNewOutput.argtypes = [
+            ctypes.POINTER(_AudioStreamBasicDescription), _AQ_BUFFER_CB,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, u32, p_aq]
+        lib.AudioQueueAllocateBuffer.restype = ctypes.c_int32
+        lib.AudioQueueAllocateBuffer.argtypes = [aq, u32,
+                                                 ctypes.POINTER(buf)]
+        lib.AudioQueueEnqueueBuffer.restype = ctypes.c_int32
+        lib.AudioQueueEnqueueBuffer.argtypes = [aq, buf, u32, ctypes.c_void_p]
+        lib.AudioQueueStart.restype = ctypes.c_int32
+        lib.AudioQueueStart.argtypes = [aq, ctypes.c_void_p]
+        lib.AudioQueueStop.restype = ctypes.c_int32
+        lib.AudioQueueStop.argtypes = [aq, ctypes.c_uint8]
+        lib.AudioQueueReset.restype = ctypes.c_int32
+        lib.AudioQueueReset.argtypes = [aq]
+        lib.AudioQueueDispose.restype = ctypes.c_int32
+        lib.AudioQueueDispose.argtypes = [aq, ctypes.c_uint8]
+        lib.AudioQueueGetProperty.restype = ctypes.c_int32
+        lib.AudioQueueGetProperty.argtypes = [aq, u32, ctypes.c_void_p, p_u32]
+        lib.AudioQueueAddPropertyListener.restype = ctypes.c_int32
+        lib.AudioQueueAddPropertyListener.argtypes = [aq, u32, _AQ_PROP_CB,
+                                                      ctypes.c_void_p]
+        lib.AudioQueueRemovePropertyListener.restype = ctypes.c_int32
+        lib.AudioQueueRemovePropertyListener.argtypes = [aq, u32, _AQ_PROP_CB,
+                                                         ctypes.c_void_p]
+
+    # -- instrumentation -------------------------------------------------
+
+    def _event(self, tag, status, extra=''):
+        """Record one lifecycle event, for the log."""
+        self._events.append((self._now() - self._t0, tag, status, extra))
+
     def _on_buffer_done(self, user_data, aq, buf_ptr):
-        addr = ctypes.cast(buf_ptr, ctypes.c_void_p).value
-        idx = self._buf_map.get(addr)
-        if idx is not None:
+        """AudioQueue has finished with a buffer: put it back in service.
+
+        Runs on AudioQueue's own thread. It must not block and must not
+        raise: an exception here costs a buffer for good, and once every
+        buffer has been lost that way the queue is silent while every
+        counter still looks healthy.
+        """
+        try:
+            now = self._now()
             with self._lock:
+                self.cb += 1
+                if self.last_cb_t is not None:
+                    self.last_cb_gap_s = now - self.last_cb_t
+                self.last_cb_t = now
+                addr = ctypes.cast(buf_ptr, ctypes.c_void_p).value
+                idx = self._buf_map.get(addr)
+                if idx is None:
+                    self.cb_unknown += 1
+                    return
+                size = 0
+                try:
+                    size = buf_ptr.contents.mAudioDataByteSize
+                except Exception:                              # noqa: BLE001
+                    pass
+                self.cb_bytes += size
+                if idx in self._in_queue:
+                    self._in_queue.discard(idx)
+                if idx in self._free_indices:
+                    # Returned twice: the queue handed back a buffer that
+                    # was already free. Handing it out again would enqueue
+                    # one buffer twice.
+                    self.cb_recycled_twice += 1
+                    return
                 self._free_indices.append(idx)
+        except Exception as exc:                               # noqa: BLE001
+            self._event('cb_raise', -1, repr(exc))
+
+    def _on_property(self, user_data, aq, prop_id):
+        """A queue property changed. Only kAudioQueueProperty_IsRunning is
+        watched, and only its transitions are interesting: they say whether
+        the queue stopped itself rather than being starved of samples."""
+        try:
+            if prop_id != K_AQ_IS_RUNNING:
+                return
+            with self._lock:
+                self.running_events += 1
+                was = self._props_seen.get('running')
+            now, _ = self._read_property(K_AQ_IS_RUNNING, ctypes.c_uint32)
+            with self._lock:
+                self._props_seen['running'] = now
+            self._event('running', 0, '%s->%s' % (was, now))
+        except Exception as exc:                               # noqa: BLE001
+            self._event('prop_raise', -1, repr(exc))
+
+    def _read_property(self, prop_id, ctype, render=None):
+        """-> (value, status). value is None when the read failed.
+
+        `ctype` is what AudioToolbox writes: kAudioQueueProperty_DeviceSample
+        Rate is a Float64, the others a UInt32. Reading the rate as an
+        integer gives a number that is not a sample rate at all.
+        """
+        aq = self._aq
+        if aq is None or not aq.value:
+            return None, -1
+        data = ctype()
+        n = ctypes.c_uint32(ctypes.sizeof(data))
+        err = self._lib.AudioQueueGetProperty(aq, prop_id,
+                                              ctypes.byref(data),
+                                              ctypes.byref(n))
+        if err != 0:
+            return None, err
+        value = data.value
+        if render == 'fourcc':
+            return _fourcc(value), 0
+        if render == 'rate':
+            return '%g Hz' % value, 0
+        return value, 0
+
+    def _update_properties(self):
+        """Refresh the polled properties; -> {name: (before, after)}."""
+        changed = {}
+        for prop_id, name, ctype, render in self._props:
+            value, err = self._read_property(prop_id, ctype, render)
+            if err != 0:
+                value = 'err:%s' % osstatus_text(err)
+            with self._lock:
+                before = self._props_seen.get(name)
+                self._props_seen[name] = value
+            if before != value:
+                changed[name] = (before, value)
+                self._event('prop', 0, '%s %s->%s' % (name, before, value))
+        return changed
+
+    def diagnostics(self):
+        """One line describing the queue, for the log and the panel.
+
+        Safe from any thread. Never raises: a diagnosis must not be able to
+        take the panel down with it.
+        """
+        try:
+            if not self._closed:
+                self._update_properties()
+            with self._lock:
+                free = len(self._free_indices)
+                in_queue = len(self._in_queue)
+                cb, cb_bytes = self.cb, self.cb_bytes
+                last_cb = self.last_cb_t
+                gap = self.last_cb_gap_s
+                props = dict(self._props_seen)
+                counts = (self.enqueued, self.enqueue_err, self.start_ok,
+                          self.start_err, self.dropped, self.played,
+                          self.cb_unknown, self.cb_recycled_twice,
+                          self.wait_to, self.running_events,
+                          self.last_status)
+            (enq, enq_err, s_ok, s_err, drop, played, unk, twice, wait_to,
+             run_ev, last_status) = counts
+            now = self._now()
+            cb_age = 'n/a' if last_cb is None else '%.1fs' % (now - last_cb)
+            return ('audioqueue: %s, block %d ms, enq %d (err %d), '
+                    'start %d/%d err, cb %d (%.1f kB, %s ago, gap %.2fs), '
+                    'free %d/%d, in-queue %d, dropped %d, wait-timeouts %d, '
+                    'unknown-cb %d, double-recycle %d, running-events %d, '
+                    'last status %s'
+                    % ('up %.1fs' % (now - self._t0), self.block_ms,
+                       enq, enq_err, s_ok, s_err, cb, cb_bytes / 1024.0,
+                       cb_age, gap, free, len(self._buf_map), in_queue,
+                       drop, wait_to, unk, twice, run_ev,
+                       osstatus_text(last_status))) + ''.join(
+                        ', %s %s' % (k, v)
+                        for k, v in sorted(props.items()))
+        except Exception as exc:                               # noqa: BLE001
+            return 'audioqueue: diagnostics failed: %r' % (exc,)
+
+    def event_log(self):
+        """The last EVENTS_KEPT lifecycle events, oldest first."""
+        with self._lock:
+            items = list(self._events)
+        return ['%7.3fs %-10s %s%s' % (t, tag, osstatus_text(status),
+                                       ' ' + extra if extra else '')
+                for t, tag, status, extra in items]
+
+    def log(self, why=''):
+        """Print the diagnostics line, and the event log when something is
+        wrong. Called by close() and periodically by the panel."""
+        line = self.diagnostics()
+        if why:
+            line = '%s (%s)' % (line, why)
+        print('[audio] %s' % line, flush=True)
+        with self._lock:
+            bad = (self.enqueue_err or self.start_err or self.cb_unknown
+                   or self.cb_recycled_twice or self.wait_to)
+        if bad:
+            for row in self.event_log():
+                print('[audio]   %s' % row, flush=True)
+
+    def faulted(self):
+        """True once the queue has reported anything wrong.
+
+        The panel asks before each periodic line, so a queue that fails in
+        the first seconds is logged at once instead of at the next poll.
+        """
+        with self._lock:
+            return bool(self.enqueue_err or self.start_err or self.wait_to
+                        or self.cb_unknown or self.cb_recycled_twice)
+
+    def poll(self):
+        """Refresh the properties and report any change. -> True if one.
+
+        The panel calls this on its own cadence while live output runs, so a
+        device change or a queue that stopped itself shows up in the log
+        near the time it happened."""
+        changed = self._update_properties()
+        for name, (before, after) in sorted(changed.items()):
+            print('[audio] audioqueue: %s %s -> %s'
+                  % (name, before, after), flush=True)
+        return bool(changed)
+
+    # -- the stream ------------------------------------------------------
 
     def queued(self):
         """Blocks handed to the device and not yet played."""
         with self._lock:
-            if not hasattr(self, '_bufs') or not self._bufs:
+            if not self._bufs:
                 return 0
-            return len(self._bufs) - len(self._free_indices)
+            return len(self._in_queue)
 
     def _free(self):
         with self._lock:
@@ -306,25 +671,50 @@ class _AudioQueueOut:
                 return self._free_indices.pop(0)
             return None
 
-    def write(self, pcm, block=False, abort=None):
-        """Append 16-bit LE PCM; full blocks go to the device at once."""
+    def write(self, pcm, block=False, abort=None, timeout=None):
+        """Append 16-bit LE PCM; full blocks go to the device at once.
+
+        block=True waits for a free buffer instead of dropping, up to
+        `timeout` seconds (WRITE_WAIT_S by default) or until `abort()` says
+        to give up. The wait is bounded because the emulator's own thread
+        writes here: an unbounded one would freeze the run, and with it the
+        recording, the panel and the display.
+        """
         pcm = apply_gain(pcm, self.gain)
         self._pending += pcm
         while len(self._pending) >= self.block:
-            if not self._submit(bytes(self._pending[:self.block]), block, abort):
+            if not self._submit(bytes(self._pending[:self.block]), block,
+                                abort, timeout):
                 return
             del self._pending[:self.block]
 
-    def _submit(self, chunk, block, abort):
+    def _submit(self, chunk, block, abort=None, timeout=None):
         """Queue one full block. -> False if abandoned (abort)."""
-        if not hasattr(self, '_aq') or self._aq is None:
+        if self._closed or self._aq is None or not self._aq.value:
             return False
         i = self._free()
-        while i is None and block:
-            if abort is not None and abort():
-                return False
-            time.sleep(0.002)
-            i = self._free()
+        if i is None and block:
+            limit = self.WRITE_WAIT_S if timeout is None else timeout
+            deadline = self._now() + limit
+            while i is None:
+                if abort is not None and abort():
+                    return False
+                if self._now() >= deadline:
+                    # The queue has stopped handing buffers back. Drop the
+                    # block, say so, and let the run carry on. The full dump
+                    # happens on the first one only: a dead device would
+                    # otherwise print this every WRITE_WAIT_S for the rest
+                    # of the session, and the periodic poll covers the rest.
+                    with self._lock:
+                        self.wait_to += 1
+                        first = self.wait_to == 1
+                    self._event('wait_to', -1, '%.1fs' % limit)
+                    if first:
+                        self.log('blocking write gave up after %.1fs' % limit)
+                    self.dropped += 1
+                    return True
+                time.sleep(0.002)
+                i = self._free()
         if i is None:
             self.dropped += 1
             return True
@@ -333,10 +723,21 @@ class _AudioQueueOut:
         buf.contents.mAudioDataByteSize = self.block
         err = self._lib.AudioQueueEnqueueBuffer(self._aq, buf, 0, None)
         if err != 0:
-            self.dropped += 1
             with self._lock:
-                self._free_indices.append(i)
+                self.enqueue_err += 1
+                self.last_status = err
+                if err != AQ_BUFFER_IN_QUEUE:
+                    # The queue did not take the buffer, so it is free
+                    # again. BufferInQueue means it did: recycling it here
+                    # is what turns one failure into a permanently
+                    # corrupted free list.
+                    self._free_indices.append(i)
+            self._event('enqueue', err, 'buffer %d' % i)
+            self.dropped += 1
             return True
+        with self._lock:
+            self._in_queue.add(i)
+            self.enqueued += 1
         # Always (re)start the queue after a successful enqueue. If the
         # queue had run dry and stopped (or was never started), this
         # restarts it; if it is already running, AudioQueueStart is
@@ -344,8 +745,13 @@ class _AudioQueueOut:
         # so after the first underrun live audio would stay silent forever
         # on macOS.
         err_start = self._lib.AudioQueueStart(self._aq, None)
-        if err_start == 0:
-            self._started = True
+        with self._lock:
+            if err_start == 0:
+                self.start_ok += 1
+            else:
+                self.start_err += 1
+                self.last_status = err_start
+        self._event('start', err_start)
         self.played += 1
         return True
 
@@ -360,16 +766,39 @@ class _AudioQueueOut:
                 return
             time.sleep(0.005)
 
-    def close(self):
-        if not hasattr(self, '_aq') or self._aq is None:
-            return
-        aq = self._aq
-        self._aq = None
+    def __del__(self):
+        """A dropped backend must not leave the queue calling back into it.
+
+        AudioQueue keeps its output callback for the life of the queue, and
+        that callback is a ctypes trampoline owned by this object. If the
+        object goes away with the queue still running, the next buffer
+        completion jumps into freed memory -- a crash at an arbitrary later
+        moment, which is how it looked when the test suite segfaulted after
+        printing OK. close() stops and disposes the queue first.
+        """
         try:
-            self._lib.AudioQueueStop(aq, True)
-            self._lib.AudioQueueDispose(aq, True)
-        except Exception:
+            self.close()
+        except Exception:                                      # noqa: BLE001
             pass
+
+    def close(self):
+        if not hasattr(self, '_closed') or self._closed:
+            return
+        self._closed = True
+        with self._lock:
+            self.lost_buffers = len(self._in_queue)
+            aq = self._aq
+            self._aq = ctypes.c_void_p()
+        try:
+            if aq is not None and aq.value:
+                self._lib.AudioQueueRemovePropertyListener(
+                    aq, K_AQ_IS_RUNNING, self._prop_cb_fn, None)
+                self._lib.AudioQueueStop(aq, True)
+                self._lib.AudioQueueDispose(aq, True)
+        except Exception:                                      # noqa: BLE001
+            pass
+        self.log('closed, %d buffer(s) still in the queue'
+                 % self.lost_buffers)
 
 
 PA_SAMPLE_S16LE = 3
@@ -464,6 +893,7 @@ class _PulseOut:
         self.gain = 1.0
         self.frame = 2 * channels
         self.block = max(self.frame, rate * block_ms // 1000 * self.frame)
+        self.block_ms = self.block * 1000 // (rate * self.frame)
         self.buffers = buffers
         self.dropped = 0
         self.played = 0
@@ -654,7 +1084,7 @@ class _PulseOut:
             n += -(-round(left * self.rate) * self.frame // self.block)
         return n
 
-    def write(self, pcm, block=False, abort=None):
+    def write(self, pcm, block=False, abort=None, timeout=None):
         """Append 16-bit LE PCM; full blocks go to the device at once."""
         if self._closed:
             return
