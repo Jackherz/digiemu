@@ -16,10 +16,6 @@ for t in tests/test_*.py; do
   else
     printf 'FAIL  %s\n' "$mod"
     printf '%s\n' "$out" | tail -40 | sed 's/^/      /'
-    # Temporary: surface the failure as a job annotation so it can be read
-    # back where the raw log is not reachable.
-    printf '::error title=%s::%s\n' "$mod" \
-      "$(printf '%s\n' "$out" | tail -25 | tr '\n' '|' | tr -d '\r' | sed 's/%/%25/g')"
     failed+=("$mod")
   fi
 done

@@ -248,6 +248,22 @@ class AudioQueueLifecycleTest(unittest.TestCase):
         finally:
             out.close()
 
+    def test_a_dropped_backend_stops_its_queue(self):
+        """AudioQueue keeps the callback, which this object owns.
+
+        Dropping the backend with the queue still running left the queue
+        calling into a freed ctypes trampoline: the suite segfaulted after
+        printing OK, which is how a live app would go down too.
+        """
+        out = self.queue()
+        out.write(self.pcm_for(out))
+        closed = []
+        real_close = out.close
+        out.close = lambda: (closed.append(True), real_close())[1]
+        out.__del__()                       # what the collector does
+        self.assertEqual(closed, [True])
+        self.assertTrue(out._closed)
+
     def test_osstatus_names_are_decoded(self):
         cases = {
             0: 'noErr',
@@ -346,6 +362,7 @@ class LiveRunSurvivesADeadDeviceTest(unittest.TestCase):
         out = emu._live_out
         self.assertGreater(out.wait_to, 0)
         self.assertIn('blocking write gave up', self.log.getvalue())
+        emu._close_live()      # as the panel does, and as the app relies on
 
     def test_a_failing_start_is_named_in_the_panel_log(self):
         """played kept climbing before, with nothing in the log to go on."""
@@ -361,6 +378,7 @@ class LiveRunSurvivesADeadDeviceTest(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         out = emu._live_out
         self.assertGreater(out.start_err, 0)
+        emu._close_live()      # as the panel does, and as the app relies on
         logged = self.log.getvalue()
         self.assertIn('kAudioQueueErr_CannotStart', logged)
         self.assertIn('start 1/', logged)

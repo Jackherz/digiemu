@@ -766,8 +766,23 @@ class _AudioQueueOut:
                 return
             time.sleep(0.005)
 
+    def __del__(self):
+        """A dropped backend must not leave the queue calling back into it.
+
+        AudioQueue keeps its output callback for the life of the queue, and
+        that callback is a ctypes trampoline owned by this object. If the
+        object goes away with the queue still running, the next buffer
+        completion jumps into freed memory -- a crash at an arbitrary later
+        moment, which is how it looked when the test suite segfaulted after
+        printing OK. close() stops and disposes the queue first.
+        """
+        try:
+            self.close()
+        except Exception:                                      # noqa: BLE001
+            pass
+
     def close(self):
-        if self._closed:
+        if not hasattr(self, '_closed') or self._closed:
             return
         self._closed = True
         with self._lock:
