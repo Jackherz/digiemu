@@ -94,14 +94,18 @@ class LiveAudioTest(Quiet):
                     out.write.assert_not_called()
                     self.assertFalse(emu._live_started)
                     emu._live_write(pcm[-4:])
-                    out.write.assert_called_once_with(pcm, block=blocking)
+                    out.write.assert_called_once_with(
+                        pcm, block=blocking,
+                        timeout=self.gui.Emulator.LIVE_WRITE_WAIT_S)
                     self.assertTrue(emu._live_started)
                     self.assertEqual(emu._live_buf, b'')
                     self.assertEqual(emu.live_underruns, 0)
                     # Once running, small chunks need no second prebuffer.
                     out.write.reset_mock()
                     emu._live_write(pcm[:4])
-                    out.write.assert_called_once_with(pcm[:4], block=blocking)
+                    out.write.assert_called_once_with(
+                        pcm[:4], block=blocking,
+                        timeout=self.gui.Emulator.LIVE_WRITE_WAIT_S)
 
     def test_underrun_rebuilds_the_platform_prebuffer_once(self):
         for platform, ms, blocking in (('darwin', 200, True),
@@ -122,7 +126,9 @@ class LiveAudioTest(Quiet):
                 self.assertEqual(emu.live_underruns, 1)
                 out.write.assert_not_called()
                 emu._live_write(pcm[-4:])
-                out.write.assert_called_once_with(pcm, block=blocking)
+                out.write.assert_called_once_with(
+                        pcm, block=blocking,
+                        timeout=self.gui.Emulator.LIVE_WRITE_WAIT_S)
                 self.assertTrue(emu._live_started)
                 self.assertEqual(emu._live_buf, b'')
                 self.assertEqual(emu.live_underruns, 1)
@@ -135,7 +141,8 @@ class LiveAudioTest(Quiet):
             pcm = b'\x01\x00\x02\x00' * 48000
             emu._live_write(pcm)
             self.waveout.return_value.write.assert_called_once_with(
-                pcm, block=True)
+                pcm, block=True,
+                timeout=self.gui.Emulator.LIVE_WRITE_WAIT_S)
             self.assertEqual(emu._live_buf, b'')
 
     def test_mute_discards_the_partial_darwin_prebuffer(self):
@@ -151,7 +158,8 @@ class LiveAudioTest(Quiet):
             self.waveout.return_value.write.assert_not_called()
             emu._live_write(pcm[4:])
             self.waveout.return_value.write.assert_called_once_with(
-                pcm, block=True)
+                pcm, block=True,
+                timeout=self.gui.Emulator.LIVE_WRITE_WAIT_S)
 
     def test_unavailable_device_is_reported_without_retrying(self):
         emu = self.emulator()
@@ -164,6 +172,69 @@ class LiveAudioTest(Quiet):
         self.assertEqual(emu._live_buf, b'')
         self.assertIn('live audio unavailable: no output device',
                       self.out.getvalue())
+
+    def test_the_live_write_bounds_its_wait_on_every_platform(self):
+        """This runs on the emulator's own thread, so it may not wait for
+        ever: a device that stopped handing buffers back would freeze the
+        run, the recording and the panel with it."""
+        for platform, blocking in (('darwin', True), ('win32', False),
+                                   ('linux', False)):
+            with self.subTest(platform=platform), \
+                    mock.patch.object(self.gui.sys, 'platform', platform):
+                emu = self.emulator()
+                emu._live_write(b'\x01\x00\x02\x00' * 48000)
+                kwargs = self.waveout.return_value.write.call_args.kwargs
+                self.assertEqual(kwargs['block'], blocking)
+                self.assertEqual(kwargs['timeout'],
+                                 self.gui.Emulator.LIVE_WRITE_WAIT_S)
+
+    def test_live_latency_is_the_backend_block_size_times_the_depth(self):
+        """Every backend enforces a 1024-frame minimum block, so the 10 ms
+        this used to assume matched none of them."""
+        emu = self.emulator()
+        out = self.waveout.return_value
+        emu._live_out = out
+        out.block_ms = 21
+        out.queued.return_value = 3
+        self.assertEqual(emu.live_latency_ms(), 63)
+        out.queued.return_value = 0
+        self.assertEqual(emu.live_latency_ms(), 0)
+
+    def test_the_device_state_is_polled_and_logged_periodically(self):
+        with mock.patch.object(self.gui.sys, 'platform', 'darwin'):
+            emu = self.emulator()
+            emu._live_write(b'\x01\x00\x02\x00' * 48000)
+            out = self.waveout.return_value
+            out.diagnostics.return_value = 'audioqueue: running 1'
+            out.faulted.return_value = False      # healthy: poll on cadence
+            emu._live_diag_t = None
+            emu._live_diag()
+            out.poll.assert_called_once()
+            self.assertIn('[audio] live: audioqueue: running 1',
+                          self.out.getvalue())
+            out.poll.reset_mock()
+            emu._live_diag()            # inside LIVE_DIAG_S: nothing to do
+            out.poll.assert_not_called()
+
+    def test_a_first_fault_is_logged_at_once_rather_than_at_the_next_poll(self):
+        """The failure this log exists to catch happens within seconds."""
+        with mock.patch.object(self.gui.sys, 'platform', 'darwin'):
+            emu = self.emulator()
+            emu._live_write(b'\x01\x00\x02\x00' * 48000)
+            out = self.waveout.return_value
+            out.faulted.return_value = True
+            emu._live_diag_t = None
+            emu._live_diag()
+            out.log.assert_called_once()
+            self.assertTrue(emu._live_fault)
+            out.poll.assert_not_called()      # the fault line replaces it
+
+    def test_a_backend_without_diagnostics_does_not_break_the_audio_loop(self):
+        emu = self.emulator()
+        emu._live_out = object()        # WavFile and any older backend
+        emu._live_diag_t = None
+        emu._live_diag()                # must not raise
+        self.assertEqual(self.out.getvalue(), '')
 
 
 @NEEDS_GUI

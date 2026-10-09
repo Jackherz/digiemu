@@ -371,6 +371,8 @@ class Emulator(threading.Thread):
         self._live_error = None
         self._live_started = False
         self._live_buf = bytearray()
+        self._live_diag_t = None    # when the device was last polled
+        self._live_fault = False    # a fault has been logged already
         # Master Volume knob position (software gain on live output). 1.0
         # = unity; 0.0 = silent; the knob goes a bit above unity if turned
         # past 12 o'clock, with clipping at the host device.
@@ -1383,12 +1385,56 @@ class Emulator(threading.Thread):
             self.audio_speed = ((self.audio_frames - self._audio_mark)
                                 / self.audio_cfg['rate'] / (now - self._audio_t))
             self._audio_t, self._audio_mark = now, self.audio_frames
+        self._live_diag()
+
+    def _live_diag(self):
+        """Ask the live device how it is, every LIVE_DIAG_S while it runs.
+
+        Live output on macOS has gone silent for good while every other
+        part of the run carried on, so the device's own state is polled and
+        logged rather than assumed: whether the queue still thinks it is
+        running, which output device it holds, what rate that device is at,
+        and whether its buffer callbacks are still arriving.
+        """
+        out = self._live_out
+        poll = getattr(out, 'poll', None)
+        diag = getattr(out, 'diagnostics', None)
+        if poll is None or diag is None:
+            return
+        now = time.monotonic()
+        try:
+            # A first fault is logged at once, with the event log: the
+            # failure this exists to catch happens within seconds, long
+            # before the next periodic line would be due.
+            faulted = getattr(out, 'faulted', None)
+            if faulted is not None and faulted() and not self._live_fault:
+                self._live_fault = True
+                self._live_diag_t = now
+                out.log('first fault')
+                return
+            if self._live_diag_t is not None and \
+                    now - self._live_diag_t < self.LIVE_DIAG_S:
+                return
+            self._live_diag_t = now
+            poll()
+            print('[audio] live: %s' % diag(), flush=True)
+        except Exception:                                    # noqa: BLE001
+            pass
 
     # Audio queued before live output starts, and again after it runs dry:
     # it absorbs the pacing's jitter (a Windows sleep can be 15 ms).
     LIVE_PREBUFFER_MS = 80
     # AudioQueue needs a larger cushion for the emulator's bursty rendering.
     LIVE_PREBUFFER_MS_DARWIN = 200
+    # Longest a live write waits for the device to hand a buffer back. A
+    # healthy queue returns one per block (~21 ms), so this only bites when
+    # the device has stopped -- and then it bounds how long the emulator
+    # thread stands still instead of hanging the run.
+    LIVE_WRITE_WAIT_S = 0.5
+    # How often the live device is asked for its state and the answer
+    # written to the log, so a queue that stopped itself or an output
+    # device that changed shows up near the time it happened.
+    LIVE_DIAG_S = 10.0
 
     def _live_write(self, pcm):
         """Send freshly rendered audio to the host device (worker thread)."""
@@ -1424,8 +1470,13 @@ class Emulator(threading.Thread):
                 return
             self._live_started = True
         # AudioQueue must accept the whole burst instead of dropping blocks
-        # when its queue fills, just as the recording Player does.
-        out.write(bytes(self._live_buf), block=(sys.platform == 'darwin'))
+        # when its queue fills, just as the recording Player does. The wait
+        # is bounded: this runs on the emulator's own thread, so an
+        # unbounded one would freeze the run -- and the recording, the panel
+        # and the display with it -- if the device stopped handing buffers
+        # back. The backend logs every time it has to give up.
+        out.write(bytes(self._live_buf), block=(sys.platform == 'darwin'),
+                  timeout=self.LIVE_WRITE_WAIT_S)
         del self._live_buf[:]
 
     def audio_mute(self, muted):
@@ -1441,8 +1492,16 @@ class Emulator(threading.Thread):
             self._live_out.gain = self._volume
 
     def live_latency_ms(self):
+        """Audio queued at the device, in milliseconds.
+
+        Reckoned from the block size the backend actually chose: every
+        backend enforces a minimum block (1024 frames, 21 ms at 48 kHz), so
+        the 10 ms this used to assume has not matched any of them.
+        """
         out = self._live_out
-        return 0 if out is None else out.queued() * 10
+        if out is None:
+            return 0
+        return out.queued() * getattr(out, 'block_ms', 20)
 
     def _close_midi(self):
         host, self.midi_host = self.midi_host, None
