@@ -1387,6 +1387,8 @@ class Emulator(threading.Thread):
     # Audio queued before live output starts, and again after it runs dry:
     # it absorbs the pacing's jitter (a Windows sleep can be 15 ms).
     LIVE_PREBUFFER_MS = 80
+    # AudioQueue needs a larger cushion for the emulator's bursty rendering.
+    LIVE_PREBUFFER_MS_DARWIN = 200
 
     def _live_write(self, pcm):
         """Send freshly rendered audio to the host device (worker thread)."""
@@ -1398,8 +1400,8 @@ class Emulator(threading.Thread):
                 # Use 20 ms blocks on all platforms: 10 ms is known to stay
                 # silent on macOS AudioQueue (150-sample buffers produce no
                 # sound), and 20 ms matches the Player and the PulseAudio
-                # backend's minimum. 40 buffers is 800 ms of capacity, with
-                # an 80 ms prebuffer to absorb jitter.
+                # backend's minimum. 40 buffers is at least 800 ms of capacity;
+                # the platform-specific prebuffer below absorbs jitter.
                 out = self._live_out = audioout.WaveOut(
                     self.audio_cfg['rate'], 2, buffers=40, block_ms=20)
             except OSError as exc:
@@ -1414,11 +1416,16 @@ class Emulator(threading.Thread):
             self.live_underruns += 1
         self._live_buf += pcm
         if not self._live_started:
-            need = self.audio_cfg['rate'] * 4 * self.LIVE_PREBUFFER_MS // 1000
+            prebuffer_ms = (self.LIVE_PREBUFFER_MS_DARWIN
+                            if sys.platform == 'darwin'
+                            else self.LIVE_PREBUFFER_MS)
+            need = self.audio_cfg['rate'] * 4 * prebuffer_ms // 1000
             if len(self._live_buf) < need:
                 return
             self._live_started = True
-        out.write(bytes(self._live_buf))
+        # AudioQueue must accept the whole burst instead of dropping blocks
+        # when its queue fills, just as the recording Player does.
+        out.write(bytes(self._live_buf), block=(sys.platform == 'darwin'))
         del self._live_buf[:]
 
     def audio_mute(self, muted):

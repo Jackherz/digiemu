@@ -56,6 +56,117 @@ class Quiet(unittest.TestCase):
 
 
 @NEEDS_GUI
+class LiveAudioTest(Quiet):
+    """Live buffering policy, without firmware, a window or a sound device."""
+
+    def setUp(self):
+        super().setUp()
+        from emu import gui
+        self.gui = gui
+        self.waveout = mock.Mock()
+        patch = mock.patch.object(gui.audioout, 'WaveOut', self.waveout)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def emulator(self, rate=48000):
+        self.waveout.reset_mock()
+        self.waveout.return_value.queued.return_value = 1
+        emu = self.gui.Emulator('gui.snap')
+        emu.audio_cfg = {'rate': rate}
+        emu.set_volume(0.5)
+        return emu
+
+    def test_initial_prebuffer_and_write_policy_by_platform_and_rate(self):
+        for platform, ms, blocking in (('darwin', 200, True),
+                                       ('win32', 80, False),
+                                       ('linux', 80, False)):
+            for rate in (44100, 48000):
+                with self.subTest(platform=platform, rate=rate), \
+                        mock.patch.object(self.gui.sys, 'platform', platform):
+                    emu = self.emulator(rate)
+                    need = rate * 4 * ms // 1000
+                    pcm = b'\x01\x00\x02\x00' * (need // 4)
+                    emu._live_write(pcm[:-4])
+                    out = self.waveout.return_value
+                    self.waveout.assert_called_once_with(
+                        rate, 2, buffers=40, block_ms=20)
+                    self.assertEqual(out.gain, 0.5)
+                    out.write.assert_not_called()
+                    self.assertFalse(emu._live_started)
+                    emu._live_write(pcm[-4:])
+                    out.write.assert_called_once_with(pcm, block=blocking)
+                    self.assertTrue(emu._live_started)
+                    self.assertEqual(emu._live_buf, b'')
+                    self.assertEqual(emu.live_underruns, 0)
+                    # Once running, small chunks need no second prebuffer.
+                    out.write.reset_mock()
+                    emu._live_write(pcm[:4])
+                    out.write.assert_called_once_with(pcm[:4], block=blocking)
+
+    def test_underrun_rebuilds_the_platform_prebuffer_once(self):
+        for platform, ms, blocking in (('darwin', 200, True),
+                                       ('win32', 80, False),
+                                       ('linux', 80, False)):
+            with self.subTest(platform=platform), \
+                    mock.patch.object(self.gui.sys, 'platform', platform):
+                emu = self.emulator()
+                pcm = b'\x01\x00\x02\x00' * (48000 * ms // 1000)
+                emu._live_write(pcm)
+                out = self.waveout.return_value
+                out.write.reset_mock()
+                out.queued.return_value = 0
+                # Several short writes must not count the same underrun twice.
+                emu._live_write(pcm[:4])
+                emu._live_write(pcm[4:-4])
+                self.assertFalse(emu._live_started)
+                self.assertEqual(emu.live_underruns, 1)
+                out.write.assert_not_called()
+                emu._live_write(pcm[-4:])
+                out.write.assert_called_once_with(pcm, block=blocking)
+                self.assertTrue(emu._live_started)
+                self.assertEqual(emu._live_buf, b'')
+                self.assertEqual(emu.live_underruns, 1)
+
+    def test_darwin_passes_a_large_burst_without_truncation(self):
+        with mock.patch.object(self.gui.sys, 'platform', 'darwin'):
+            emu = self.emulator()
+            # More than the host queue's capacity: every frame must be passed
+            # with backpressure rather than the non-blocking drop policy.
+            pcm = b'\x01\x00\x02\x00' * 48000
+            emu._live_write(pcm)
+            self.waveout.return_value.write.assert_called_once_with(
+                pcm, block=True)
+            self.assertEqual(emu._live_buf, b'')
+
+    def test_mute_discards_the_partial_darwin_prebuffer(self):
+        with mock.patch.object(self.gui.sys, 'platform', 'darwin'):
+            emu = self.emulator()
+            pcm = b'\x01\x00\x02\x00' * (48000 * 200 // 1000)
+            emu._live_write(pcm[:-4])
+            emu.audio_mute(True)
+            self.assertEqual(emu._live_buf, b'')
+            self.assertFalse(emu._live_started)
+            emu.audio_mute(False)
+            emu._live_write(pcm[:4])
+            self.waveout.return_value.write.assert_not_called()
+            emu._live_write(pcm[4:])
+            self.waveout.return_value.write.assert_called_once_with(
+                pcm, block=True)
+
+    def test_unavailable_device_is_reported_without_retrying(self):
+        emu = self.emulator()
+        self.waveout.side_effect = OSError('no output device')
+        emu._live_write(b'\x01\x00\x02\x00')
+        emu._live_write(b'\x01\x00\x02\x00')
+        self.waveout.assert_called_once()
+        self.assertEqual(emu._live_error, 'no output device')
+        self.assertFalse(emu._live_started)
+        self.assertEqual(emu._live_buf, b'')
+        self.assertIn('live audio unavailable: no output device',
+                      self.out.getvalue())
+
+
+@NEEDS_GUI
 class SetupErrorTest(Quiet):
     """Emulator.run reports what used to kill it, and always sets ready."""
 
