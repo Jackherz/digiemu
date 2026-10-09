@@ -1395,8 +1395,13 @@ class Emulator(threading.Thread):
             if self._live_error:
                 return
             try:
+                # Use 20 ms blocks on all platforms: 10 ms is known to stay
+                # silent on macOS AudioQueue (150-sample buffers produce no
+                # sound), and 20 ms matches the Player and the PulseAudio
+                # backend's minimum. 40 buffers is 800 ms of capacity, with
+                # an 80 ms prebuffer to absorb jitter.
                 out = self._live_out = audioout.WaveOut(
-                    self.audio_cfg['rate'], 2, buffers=40, block_ms=10)
+                    self.audio_cfg['rate'], 2, buffers=40, block_ms=20)
             except OSError as exc:
                 self._live_error = str(exc)
                 print('[gui] live audio unavailable: %s' % exc, flush=True)
